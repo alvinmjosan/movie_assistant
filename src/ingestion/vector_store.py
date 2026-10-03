@@ -9,7 +9,9 @@ load_dotenv()
 # We import the embedding function specifically for OpenAI
 import chromadb.utils.embedding_functions as embedding_functions
 
-def populate_vector_store(subtitles: List[Dict], collection_name: str = "movie_dialogue", persist_directory: str = "./chroma_db"):
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
+
+def populate_vector_store(subtitles: List[Dict], collection_name: str = "movie_dialogue", persist_directory: str = DEFAULT_DB_PATH):
     """
     Takes the parsed subtitles and stores them into a local ChromaDB vector store
     using OpenAI's precise embeddings.
@@ -52,7 +54,7 @@ def populate_vector_store(subtitles: List[Dict], collection_name: str = "movie_d
     
     print("Database populated successfully!")
 
-def query_vector_store(query_text: str, collection_name: str = "movie_dialogue", persist_directory: str = "./chroma_db", n_results: int = 3):
+def query_vector_store(query_text: str, collection_name: str = "movie_dialogue", persist_directory: str = DEFAULT_DB_PATH, n_results: int = 3):
     """
     Queries the vector database using OpenAI embeddings.
     """
@@ -82,7 +84,8 @@ if __name__ == "__main__":
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from srt_parser import parse_srt
     
-    sample_file = r"..\..\data\subtitles\The_Matrix_1999.srt"
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sample_file = os.path.join(base_dir, "data", "subtitles", "The_Matrix_1999.srt")
     
     if not os.environ.get("OPENAI_API_KEY"):
         print("Please set your OPENAI_API_KEY in the .env file before running this test.")
@@ -90,12 +93,11 @@ if __name__ == "__main__":
         
     try:
         subs = parse_srt(sample_file, "The Matrix")
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
-        populate_vector_store(subs, persist_directory=db_path)
+        populate_vector_store(subs)
         
         print("\n--- Testing a Query ---")
         question = "What happens to Neo?"
-        results = query_vector_store(question, persist_directory=db_path, n_results=1)
+        results = query_vector_store(question, n_results=1)
         
         print("\nTop Result Found:")
         print(f"Dialogue: {results['documents'][0][0]}")

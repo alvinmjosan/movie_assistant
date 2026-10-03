@@ -1,3 +1,4 @@
+import os
 import re
 from typing import List, Dict
 
@@ -13,7 +14,7 @@ def parse_srt(file_path: str, movie_title: str) -> List[Dict]:
         A list of dictionaries with 'text', 'start_time', 'end_time', and 'movie_title'.
     """
     with open(file_path, "r", encoding="utf-8-sig") as file:
-        content = file.read()
+        content = file.read().replace("\r\n", "\n")
 
     # Split the file by blank lines, which separate subtitle blocks
     blocks = content.strip().split("\n\n")
@@ -58,11 +59,12 @@ def parse_srt(file_path: str, movie_title: str) -> List[Dict]:
 if __name__ == "__main__":
     # Test script for learning purposes
     print("Testing parser...")
-    # This expects you to have the sample Matrix SRT file we created earlier
-    sample_file = r"..\..\data\subtitles\The_Matrix_1999.srt"
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sample_file = os.path.join(base_dir, "data", "subtitles", "The_Matrix_1999.srt")
     try:
         results = parse_srt(sample_file, "The Matrix")
         for r in results:
             print(r)
+        print(f"Parsed {len(results)} subtitle entries successfully.")
     except Exception as e:
         print(f"Error testing parser: {e}")
