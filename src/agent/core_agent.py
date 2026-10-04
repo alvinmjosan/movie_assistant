@@ -143,7 +143,10 @@ def _system_prompt() -> Dict:
             "If the previous assistant turn mentioned a specific title, use that title "
             "as the query for query_movie_database. Never search with bare pronouns. "
             "9. If the user asks who is in a movie, podcast, or show, which characters appear, "
-            "or asks for the cast or hosts, ALWAYS use list_characters. Do not list them from memory."
+            "or asks for the cast or hosts, ALWAYS use list_characters. Do not list them from memory. "
+            "10. If the user names a specific title that is not indexed, do NOT substitute a "
+            "different title from context. Reply that the requested title is not available "
+            "and list what IS available. Never answer about a different title than the one asked."
         ),
     }
 
@@ -202,9 +205,8 @@ def _list_characters_text(movie_title: Optional[str] = None) -> str:
 def _retrieve_movie_overview(movie_title: str, n: int = 6) -> List[Dict[str, Any]]:
     """
     Return evenly spaced chunks from a movie for open-ended summaries.
-    Used instead of semantic top-K retrieval when the user asks to summarize
-    or give an overview — those queries need coverage across the episode,
-    not the chunks most similar to a vague phrase.
+    Used together with semantic retrieval so the LLM has both coverage
+    (whole episode) and precision (specific lines it may want to quote).
     """
     try:
         from ingestion.vector_store import _collection
@@ -240,6 +242,27 @@ def _retrieve_movie_overview(movie_title: str, n: int = 6) -> List[Dict[str, Any
         return []
 
 
+def _merge_blocks(*block_lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merge multiple lists of dialogue blocks and dedupe by a composite key.
+    Preserves insertion order so overview chunks come first, then semantic hits.
+    """
+    seen = set()
+    merged: List[Dict[str, Any]] = []
+    for blocks in block_lists:
+        for b in blocks or []:
+            key = (
+                b.get("start_time", ""),
+                b.get("end_time", ""),
+                (b.get("dialogue", "") or "")[:60],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(b)
+    return merged
+
+
 FOLLOWUP_VERBS = (
     "summarize", "summarise", "summary", "describe", "explain",
     "elaborate", "continue", "more", "details", "tell",
@@ -257,6 +280,37 @@ CHARACTER_FOLLOWUP_PHRASES = (
     "who are the characters", "who are the people", "who is in it",
     "who's in it", "cast", "characters",
 )
+
+# Words that are never titles in follow-up contexts.
+_STOP_TITLE_WORDS = {
+    "the", "a", "an", "this", "that", "it", "movie", "film", "show",
+    "podcast", "episode", "content", "about", "tell", "me", "give",
+    "summarize", "summarise", "describe", "explain", "list", "more",
+    "details", "info", "information", "what", "is", "are", "who",
+    "how", "when", "where", "why", "and", "or", "of", "in", "on",
+    "you", "your", "do", "does", "have", "has", "can", "could",
+    "would", "should", "please", "know", "summary",
+}
+
+
+def _query_names_a_title(user_query: str) -> bool:
+    """
+    Return True if the query contains a token that looks like a specific
+    title reference — any non-stop-word that isn't a common verb or pronoun.
+    Case-insensitive so lowercase titles (e.g. 'titanic') are still caught.
+    """
+    words = user_query.strip().split()
+    for w in words:
+        clean = w.strip(".,!?'\"").lower()
+        if not clean:
+            continue
+        if clean in _STOP_TITLE_WORDS:
+            continue
+        if clean in FOLLOWUP_VERBS:
+            continue
+        # Any remaining word is likely a title reference.
+        return True
+    return False
 
 
 def _is_followup(user_query: str) -> bool:
@@ -332,7 +386,12 @@ def get_agent_response(
         }
 
     # Verb-specific rewrite templates — each intent produces a distinct retrieval focus.
-    if last_movie and _is_followup(user_query):
+    # Skip the rewrite when the user names a specific title so their title takes precedence.
+    if (
+        last_movie
+        and _is_followup(user_query)
+        and not _query_names_a_title(original_query)
+    ):
         q_lower = original_query.strip().lower()
         first_word = q_lower.split()[0] if q_lower.split() else ""
 
@@ -434,13 +493,19 @@ def get_agent_response(
                 q_lower = q_arg.strip().lower()
                 is_summarize = q_lower.startswith(("summarize", "summarise", "summary"))
 
-                # For summarize queries, sample evenly spaced chunks across the episode.
                 if is_summarize and last_movie_seen:
-                    blocks = _retrieve_movie_overview(last_movie_seen, n=6)
-                    if blocks:
+                    # Merge evenly-spaced overview chunks with semantic top-K so
+                    # the LLM has both coverage and precision for the summary.
+                    overview_blocks = _retrieve_movie_overview(last_movie_seen, n=6)
+                    semantic_result = _run_movie_query(q_arg)
+                    semantic_blocks = semantic_result.get("blocks", [])
+
+                    merged_blocks = _merge_blocks(overview_blocks, semantic_blocks)
+
+                    if merged_blocks:
                         result = {
-                            "context_str": format_context(blocks),
-                            "blocks": blocks,
+                            "context_str": format_context(merged_blocks),
+                            "blocks": merged_blocks,
                             "empty": False,
                         }
                     else:
