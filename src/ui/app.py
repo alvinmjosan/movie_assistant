@@ -9,7 +9,7 @@ from mcp.mcp_client import call_email_via_mcp
 
 st.set_page_config(page_title="Movie Intelligence Assistant", layout="centered")
 
-st.title("🎬 Movie Intelligence & Follow-up Assistant")
+st.title("🎬 Movie Assistant")
 st.markdown(
     "Ask about movie plots or dialogue, retrieve cited scenes, or send scene reports by email "
     "via the MCP email tool."
