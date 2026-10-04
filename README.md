@@ -19,7 +19,7 @@ An AI agent that processes `.srt` subtitle files across a collection of movies t
 
 1. **Clone the repository:**
    ```bash
-   git clone <your-repo-link>
+   git clone https://github.com/alvinmjosan/movie_assistant.git
    cd movie-assistant
    ```
 
