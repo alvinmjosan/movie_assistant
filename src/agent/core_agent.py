@@ -1,6 +1,7 @@
 import os
 import json
 import sys
+import re
 from typing import Dict, List, Optional, Any
 
 from openai import OpenAI
@@ -18,12 +19,12 @@ GPT_MODEL = "gpt-4o-mini"
 MAX_TOOL_ITERATIONS = 5
 
 REFUSAL_NO_CONTEXT = (
-    "I don't have that information in the movie database. "
-    "That movie or scene has not been ingested."
+    "I don't have that information in the content database. "
+    "That content or scene has not been ingested."
 )
 REFUSAL_UNCITED = (
-    "I couldn't ground an answer in the movie database for that question. "
-    "Please ingest the relevant .srt file or rephrase with a specific movie or quote."
+    "I couldn't ground an answer in the content database for that question. "
+    "Please ingest the relevant .srt file or rephrase with a specific title or quote."
 )
 
 
@@ -34,8 +35,10 @@ def _tool_definitions() -> List[Dict]:
             "function": {
                 "name": "query_movie_database",
                 "description": (
-                    "Searches the vector database for actual movie dialogue, quotes, or scenes. "
-                    "Use this whenever the user asks a factual question about a movie or character."
+                    "Searches the vector database for actual dialogue, quotes, or scenes "
+                    "from any indexed content — movies, podcasts, shows, or conversations. "
+                    "ALWAYS call this for any factual question about content BEFORE answering "
+                    "or refusing."
                 ),
                 "parameters": {
                     "type": "object",
@@ -113,36 +116,40 @@ def _system_prompt() -> Dict:
     return {
         "role": "system",
         "content": (
-            "You are a professional Movie Intelligence AI. "
+            "You are a professional Content Intelligence AI. "
             "Rules: "
-            "1. For factual movie questions, ALWAYS use query_movie_database first. "
-            "2. When answering with movie facts, ALWAYS include citations formatted as "
-            "'[Movie Title, HH:MM:SS - HH:MM:SS]'. "
-            "3. For email requests: FIRST retrieve relevant movie context via query_movie_database, "
+            "0. BEFORE answering or refusing ANY question about content — movies, podcasts, "
+            "shows, dialogue, scenes, or conversations — you MUST call query_movie_database "
+            "first, passing the user's question as the query. Only refuse AFTER the tool "
+            "returns no relevant context. "
+            "1. For any factual question, ALWAYS use query_movie_database first. "
+            "2. When answering with content facts, ALWAYS include citations formatted as "
+            "'[Title, HH:MM:SS - HH:MM:SS]'. "
+            "3. For email requests: FIRST retrieve relevant content via query_movie_database, "
             "THEN compose the email. Never guess a recipient email. If missing, ask the user. "
-            "4. If the user's request is ambiguous (missing movie, scene, or recipient), ask a "
+            "4. If the user's request is ambiguous (missing title, scene, or recipient), ask a "
             "clarifying question instead of taking action. "
-            "5. NEVER use general knowledge about movies. "
+            "5. NEVER use general knowledge about content. "
             "If query_movie_database returns no relevant context, reply exactly: "
-            "'I don't have that information in the movie database.' "
-            "Do NOT summarize plots from memory. Do NOT name actors or directors. "
-            "6. If the user asks anything about which movies are available, indexed, known, "
+            "'I don't have that information in the content database.' "
+            "Do NOT summarize plots from memory. Do NOT name actors, hosts, or directors. "
+            "6. If the user asks anything about which titles are available, indexed, known, "
             "stored, listed, or in the database — using ANY phrasing — ALWAYS use list_movies. "
             "Do not guess titles. "
             "7. After a query_movie_database that returns no relevant context, do NOT stop at "
-            "the refusal. Instead, list the available movies and suggest the user pick one. "
+            "the refusal. Instead, list the available titles and suggest the user pick one. "
             "8. If the user refers to something using pronouns or definite references "
-            "(e.g. 'the movie', 'that scene', 'it'), resolve them from the recent chat history. "
-            "If the previous assistant turn mentioned a specific movie, use that movie's title "
+            "(e.g. 'it', 'that scene', 'the title'), resolve them from the recent chat history. "
+            "If the previous assistant turn mentioned a specific title, use that title "
             "as the query for query_movie_database. Never search with bare pronouns. "
-            "9. If the user asks who is in a movie, which characters appear, or asks for the cast, "
-            "ALWAYS use list_characters. Do not list characters from memory."
+            "9. If the user asks who is in a movie, podcast, or show, which characters appear, "
+            "or asks for the cast or hosts, ALWAYS use list_characters. Do not list them from memory."
         ),
     }
 
 
 def _run_movie_query(query: str) -> Dict[str, Any]:
-    results = retrieve(query, top_k=5)
+    results = retrieve(query, top_k=8)
     blocks = build_context(results)
 
     if not blocks:
@@ -168,8 +175,8 @@ def _list_movies_text() -> str:
         return f"Error listing movies: {e}"
 
     if not titles:
-        return "The movie database is empty."
-    return "Indexed movies:\n" + "\n".join(f"- {t}" for t in titles)
+        return "The content database is empty."
+    return "Indexed titles:\n" + "\n".join(f"- {t}" for t in titles)
 
 
 def _list_characters_text(movie_title: Optional[str] = None) -> str:
@@ -189,7 +196,48 @@ def _list_characters_text(movie_title: Optional[str] = None) -> str:
             lines.append(f"- {movie}: {', '.join(chars)}")
         else:
             lines.append(f"- {movie}: (no characters extracted)")
-    return "Characters by movie:\n" + "\n".join(lines)
+    return "Characters by title:\n" + "\n".join(lines)
+
+
+def _retrieve_movie_overview(movie_title: str, n: int = 6) -> List[Dict[str, Any]]:
+    """
+    Return evenly spaced chunks from a movie for open-ended summaries.
+    Used instead of semantic top-K retrieval when the user asks to summarize
+    or give an overview — those queries need coverage across the episode,
+    not the chunks most similar to a vague phrase.
+    """
+    try:
+        from ingestion.vector_store import _collection
+        db_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "ingestion",
+            "chroma_db",
+        )
+        col = _collection(db_path, "movie_dialogue")
+        data = col.get(
+            where={"movie_title": movie_title},
+            include=["documents", "metadatas"],
+        )
+        docs = data.get("documents", []) or []
+        metas = data.get("metadatas", []) or []
+        if not docs:
+            return []
+
+        step = max(1, len(docs) // n)
+        blocks: List[Dict[str, Any]] = []
+        for i in range(0, len(docs), step):
+            if len(blocks) >= n:
+                break
+            blocks.append({
+                "dialogue": docs[i],
+                "movie_title": metas[i].get("movie_title", ""),
+                "start_time": metas[i].get("start_time", ""),
+                "end_time": metas[i].get("end_time", ""),
+                "speakers": metas[i].get("speakers", ""),
+            })
+        return blocks
+    except Exception:
+        return []
 
 
 FOLLOWUP_VERBS = (
@@ -204,7 +252,6 @@ FOLLOWUP_PHRASES = (
     "tell me more", "more details", "give me details",
 )
 
-# NEW: phrases that signal a follow-up about the characters just listed.
 CHARACTER_FOLLOWUP_PHRASES = (
     "who are they", "who are these", "who is that", "who are those",
     "who are the characters", "who are the people", "who is in it",
@@ -236,10 +283,14 @@ def _is_followup(user_query: str) -> bool:
     return False
 
 
-# NEW: detect follow-ups asking about the characters.
 def _is_character_followup(user_query: str) -> bool:
+    """Detect queries asking about characters, using word-boundary matching
+    so 'cast' does not match inside 'podcast'."""
     q = user_query.strip().lower()
-    return any(p in q for p in CHARACTER_FOLLOWUP_PHRASES)
+    for phrase in CHARACTER_FOLLOWUP_PHRASES:
+        if re.search(rf"\b{re.escape(phrase)}\b", q):
+            return True
+    return False
 
 
 def get_agent_response(
@@ -254,7 +305,7 @@ def get_agent_response(
     original_query = user_query
     character_followup = _is_character_followup(user_query)
 
-    # NEW: deterministic character follow-up — pure metadata lookup, no LLM needed.
+    # Deterministic character follow-up — pure metadata lookup, no LLM needed.
     if last_movie and character_followup:
         try:
             from ingestion.vector_store import list_characters
@@ -280,20 +331,37 @@ def get_agent_response(
             "last_movie": last_movie,
         }
 
+    # Verb-specific rewrite templates — each intent produces a distinct retrieval focus.
     if last_movie and _is_followup(user_query):
-        first_word = user_query.strip().lower().split()[0]
-        if first_word in FOLLOWUP_VERBS:
+        q_lower = original_query.strip().lower()
+        first_word = q_lower.split()[0] if q_lower.split() else ""
+
+        if first_word in ("summarize", "summarise", "summary"):
             user_query = (
-                f"User is asking about the movie '{last_movie}'. "
-                f"Your task: quote 3-5 specific dialogue lines from this movie "
-                f"and cite each with [Movie Title, HH:MM:SS - HH:MM:SS]. "
-                f"Do NOT paraphrase or summarize — only quote with citations. "
-                f"Their message: {original_query}"
+                f"{original_query} "
+                f"(Context: the user wants a condensed summary of '{last_movie}'. "
+                f"Produce 2-4 sentences describing what this content is about — "
+                f"its main topic, who is speaking, and the overall tone. "
+                f"You may include 1 short quote with citation if it strengthens the summary.)"
+            )
+        elif first_word in ("describe", "explain", "elaborate", "tell"):
+            user_query = (
+                f"{original_query} "
+                f"(Context: the user wants an overview of '{last_movie}'. "
+                f"Cover the main themes and topics, mention the speakers, and include "
+                f"2-3 short dialogue quotes with citations to illustrate.)"
+            )
+        elif first_word in ("more", "continue", "details"):
+            user_query = (
+                f"{original_query} "
+                f"(Context: the user wants additional detail about '{last_movie}'. "
+                f"Quote 3-5 specific dialogue lines with citations on topics that "
+                f"weren't already covered.)"
             )
         else:
             user_query = (
-                f"User is asking about the movie '{last_movie}'. "
-                f"Their message: {original_query}"
+                f"{original_query} "
+                f"(Context: the user is asking about '{last_movie}'.)"
             )
 
     messages = [_system_prompt()] + chat_history + [{"role": "user", "content": user_query}]
@@ -311,6 +379,16 @@ def get_agent_response(
         )
         msg = response.choices[0].message
 
+        # Fallback: force a tool call if the LLM tried to answer or refuse without consulting the DB.
+        if not msg.tool_calls and not tool_log:
+            response = client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=messages,
+                tools=_tool_definitions(),
+                tool_choice="required",
+            )
+            msg = response.choices[0].message
+
         if not msg.tool_calls:
             final_text = msg.content or ""
 
@@ -320,7 +398,7 @@ def get_agent_response(
                     listing = _list_movies_text()
                     return {
                         "answer": (
-                            "I couldn't ground an answer in the movie database for that question.\n\n"
+                            "I couldn't ground an answer in the content database for that question.\n\n"
                             "Here's what I do have:\n\n" + listing +
                             "\n\nTry asking about one of these, or ingest the relevant .srt file."
                         ),
@@ -352,14 +430,31 @@ def get_agent_response(
             print(f"--> [System] Agent requested '{name}' with args {args}")
 
             if name == "query_movie_database":
-                result = _run_movie_query(args.get("query", ""))
+                q_arg = args.get("query", "") or ""
+                q_lower = q_arg.strip().lower()
+                is_summarize = q_lower.startswith(("summarize", "summarise", "summary"))
+
+                # For summarize queries, sample evenly spaced chunks across the episode.
+                if is_summarize and last_movie_seen:
+                    blocks = _retrieve_movie_overview(last_movie_seen, n=6)
+                    if blocks:
+                        result = {
+                            "context_str": format_context(blocks),
+                            "blocks": blocks,
+                            "empty": False,
+                        }
+                    else:
+                        result = _run_movie_query(q_arg)
+                else:
+                    result = _run_movie_query(q_arg)
+
                 tool_result_str = result["context_str"]
                 tool_log.append({"name": name, "args": args, "result": tool_result_str})
 
                 if result["empty"]:
                     listing = _list_movies_text()
                     answer = (
-                        "I don't have that specific movie or scene in the database. "
+                        "I don't have that specific content or scene in the database. "
                         "Here's what I do have:\n\n" + listing +
                         "\n\nTry asking about one of these, or ingest the relevant .srt file."
                     )
